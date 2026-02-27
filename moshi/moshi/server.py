@@ -26,6 +26,7 @@
 
 import argparse
 import asyncio
+import collections
 from dataclasses import dataclass
 import random
 import os
@@ -34,6 +35,7 @@ import tarfile
 import time
 import secrets
 import sys
+import re
 from typing import Literal, Optional
 
 import aiohttp
@@ -49,7 +51,75 @@ from .client_utils import make_log, colorize
 from .models import loaders, MimiModel, LMModel, LMGen
 from .utils.connection import create_ssl_context, get_lan_ip
 from .utils.logging import setup_logger, ColorizedLog
+import hashlib
+import pickle
+import threading
 
+
+
+# CredKey: Directory for prompt_id disk loading
+PROMPT_DIR = Path("/opt/credkey/moshi-prompts")
+
+# CredKey: Token caching for fast handshakes (prompt tokenization is CPU-bound)
+_PROMPT_TOKEN_CACHE = {}  # {cache_key: (tokens, token_count)}
+_PROMPT_TOKEN_CACHE_LOCK = threading.Lock()
+_PROMPT_TOKEN_CACHE_DIR = PROMPT_DIR / ".cache"
+
+def _credkey_get_prompt_tokens_cached(text_prompt, prompt_id, text_tokenizer, wrap_fn, clog):
+    if not text_prompt:
+        return None
+
+    prompt_hash = hashlib.sha256(text_prompt.encode("utf-8")).hexdigest()
+    cache_key = f"{prompt_id or 'inline'}:{prompt_hash[:16]}"
+
+    v = _PROMPT_TOKEN_CACHE.get(cache_key)
+    if v is not None:
+        tokens, token_count = v
+        try: clog.log("info", f"TOKEN_CACHE_HIT mem prompt_id={prompt_id} sha={prompt_hash[:8]} tokens={token_count}")
+        except Exception: pass
+        return tokens
+
+    with _PROMPT_TOKEN_CACHE_LOCK:
+        v = _PROMPT_TOKEN_CACHE.get(cache_key)
+        if v is not None:
+            return v[0]
+
+        if prompt_id:
+            try:
+                _PROMPT_TOKEN_CACHE_DIR.mkdir(parents=True, exist_ok=True, mode=0o755)
+                cache_file = _PROMPT_TOKEN_CACHE_DIR / f"{prompt_id}.{prompt_hash[:16]}.tokens"
+                if cache_file.exists():
+                    with open(cache_file, "rb") as f:
+                        tokens = pickle.load(f)
+                    token_count = len(tokens) if hasattr(tokens, "__len__") else "?"
+                    _PROMPT_TOKEN_CACHE[cache_key] = (tokens, token_count)
+                    try: clog.log("info", f"TOKEN_CACHE_HIT disk prompt_id={prompt_id} sha={prompt_hash[:8]} tokens={token_count}")
+                    except Exception: pass
+                    return tokens
+            except Exception as e:
+                try: clog.log("warning", f"TOKEN_CACHE disk read failed {cache_key}: {e}")
+                except Exception: pass
+
+        t0 = time.time()
+        tokens = text_tokenizer.encode(wrap_fn(text_prompt))
+        ms = int((time.time() - t0) * 1000)
+        token_count = len(tokens) if hasattr(tokens, "__len__") else "?"
+        _PROMPT_TOKEN_CACHE[cache_key] = (tokens, token_count)
+
+        if prompt_id:
+            try:
+                _PROMPT_TOKEN_CACHE_DIR.mkdir(parents=True, exist_ok=True, mode=0o755)
+                cache_file = _PROMPT_TOKEN_CACHE_DIR / f"{prompt_id}.{prompt_hash[:16]}.tokens"
+                with open(cache_file, "wb") as f:
+                    pickle.dump(tokens, f)
+            except Exception as e:
+                try: clog.log("warning", f"TOKEN_CACHE disk write failed {cache_key}: {e}")
+                except Exception: pass
+
+        try: clog.log("info", f"TOKEN_CACHE_MISS tokenized prompt_id={prompt_id} bytes={len(text_prompt)} sha={prompt_hash[:8]} tokenize_ms={ms} tokens={token_count}")
+        except Exception: pass
+
+        return tokens
 
 logger = setup_logger(__name__)
 DeviceString = Literal["cuda"] | Literal["cpu"] #| Literal["mps"]
@@ -86,6 +156,19 @@ def wrap_with_system_tags(text: str) -> str:
     return f"<system> {cleaned} <system>"
 
 
+# Phase 2: Inline text injection — force script tokens into Moshi generation
+CREDKEY_INLINE_TEXT = os.environ.get("CREDKEY_INLINE_TEXT", "0") == "1"
+CREDKEY_INLINE_EOS = os.environ.get("CREDKEY_INLINE_EOS", "0") == "1"       # append EOS after line (OFF by default — corrupts model state)
+CREDKEY_IDLE_PAD = os.environ.get("CREDKEY_IDLE_PAD", "1") == "1"           # force PAD when no injection queued (suppresses hallucination)
+CREDKEY_INLINE_PROSODY = os.environ.get("CREDKEY_INLINE_PROSODY", "0") == "1"
+CREDKEY_POST_PAD_FRAMES = int(os.environ.get("CREDKEY_POST_PAD_FRAMES", "0"))
+CREDKEY_INJECT_STRIDE = int(os.environ.get("CREDKEY_INJECT_STRIDE", "1"))  # frames between token injections  # extra PAD frames after line ends
+INLINE_TOKEN_CAP = 250  # hard cap: drop tokens beyond this
+TEXT_PAD_ID = 3   # <pad> — blank/no-text token
+# Prosody: pause frames after punctuation (only when CREDKEY_INLINE_PROSODY=1)
+_PUNCT_PAUSE = {261: 2, 263: 4, 330: 4, 430: 4}  # comma=2, period/question/excl=4
+
+
 @dataclass
 class ServerState:
     mimi: MimiModel
@@ -111,6 +194,15 @@ class ServerState:
                             save_voice_prompt_embeddings=save_voice_prompt_embeddings,
         )
         
+        self._pending_inline_text = None           # Ramp B: inline text from shim (kind==2)
+        self._inline_text_tokens = collections.deque()  # tokenized queue, fed one-per-step
+        self._inline_pause_frames = 0             # prosody: remaining pause frames after punctuation
+        self._inline_inject_active = False        # True while queue is draining
+        self._inline_postpad_remaining = 0        # post-line PAD hold frames
+        self._inline_idle_pad_on = False          # True when idle PAD suppression is active (for logging)
+        self._inline_forced_log = None            # comparison: forced token accumulator
+        self._inline_emitted_log = None           # comparison: emitted token accumulator
+        self._inline_frames_in_inject = 0         # for rate-limited logging
         self.lock = asyncio.Lock()
         self.mimi.streaming_forever(1)
         self.other_mimi.streaming_forever(1)
@@ -167,13 +259,42 @@ class ServerState:
                 self.lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
             else:
                 self.lm_gen.load_voice_prompt(voice_prompt_path)
-        self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(request.query["text_prompt"])) if len(request.query["text_prompt"]) > 0 else None
+        # CredKey: Load text_prompt from disk via prompt_id (if provided)
+        text_prompt = request.query.get("text_prompt", "")
+        prompt_id = request.query.get("prompt_id")
+        if prompt_id:
+            if not re.match(r"^[A-Za-z0-9_-]{1,64}$", prompt_id):
+                try: clog.log("error", f"Invalid prompt_id format: {prompt_id}")
+                except Exception: pass
+            else:
+                prompt_file = PROMPT_DIR / f"{prompt_id}.txt"
+                try:
+                    if prompt_file.exists() and prompt_file.is_file():
+                        text_prompt = prompt_file.read_text(encoding="utf-8")
+                        try: clog.log("info", f"Loaded prompt_id={prompt_id} ({len(text_prompt)} bytes)")
+                        except Exception: pass
+                    else:
+                        try: clog.log("warning", f"prompt_id={prompt_id} file not found: {prompt_file}")
+                        except Exception: pass
+                except Exception as e:
+                    try: clog.log("error", f"Failed reading prompt_id={prompt_id}: {e}")
+                    except Exception: pass
+
+        self.lm_gen.text_prompt_tokens = await asyncio.to_thread(_credkey_get_prompt_tokens_cached, text_prompt, prompt_id, self.text_tokenizer, wrap_with_system_tags, clog)
+        self.lm_gen.text_prompt = text_prompt
         seed = int(request["seed"]) if "seed" in request.query else None
 
         async def recv_loop():
             nonlocal close
+            clog.log("info", "P0_DEBUG recv_loop STARTED")
+            recv_frame_count = 0
             try:
                 async for message in ws:
+                    recv_frame_count += 1
+                    if recv_frame_count == 1:
+                        clog.log("info", f"P0_DEBUG recv_loop FIRST_MESSAGE type={message.type}")
+                    if recv_frame_count % 200 == 0:
+                        clog.log("info", f"P0_DEBUG recv_loop frames={recv_frame_count}")
                     if message.type == aiohttp.WSMsgType.ERROR:
                         clog.log("error", f"{ws.exception()}")
                         break
@@ -195,20 +316,42 @@ class ServerState:
                     if kind == 1:  # audio
                         payload = message[1:]
                         opus_reader.append_bytes(payload)
+                    elif kind == 2:  # inline text from shim (Ramp B)
+                        text = message[1:].decode("utf-8", errors="replace")
+                        clog.log("info", f"INLINE_TEXT_RECEIVED len={len(text)}: {text[:100]}")
+                        self._pending_inline_text = text
                     else:
                         clog.log("warning", f"unknown message kind {kind}")
             finally:
                 close = True
+                clog.log("info", f"P0_DEBUG recv_loop ENDED frames={recv_frame_count}")
                 clog.log("info", "connection closed")
 
         async def opus_loop():
             all_pcm_data = None
+            clog.log("info", "P0_DEBUG opus_loop STARTED")
+            opus_frames_processed = 0
+            opus_writes_to_writer = 0
+            opus_text_tokens = 0
+            opus_loop_start_time = time.time()
+
+            # [CredKey] Phase 1.6: Generation-Level Gate
+            CREDKEY_GEN_GATE = os.environ.get("CREDKEY_GEN_GATE", "0") == "1"
+            CREDKEY_GEN_GATE_N = int(os.environ.get("CREDKEY_GEN_GATE_N", "25"))
+            gen_gate_released = not CREDKEY_GEN_GATE
+            skipped_gen_steps = 0
+            if CREDKEY_GEN_GATE:
+                clog.log("info", f"[CredKey] GEN_GATE_ON n_required={CREDKEY_GEN_GATE_N}")
 
             while True:
                 if close:
+                    clog.log("info", f"P0_DEBUG opus_loop ENDED close=True frames_processed={opus_frames_processed} opus_writes={opus_writes_to_writer} text_tokens={opus_text_tokens}")
                     return
                 await asyncio.sleep(0.001)
                 pcm = opus_reader.read_pcm()
+                if pcm is None:
+                    await asyncio.sleep(0.01)
+                    continue
                 if pcm.shape[-1] == 0:
                     continue
                 if all_pcm_data is None:
@@ -216,6 +359,9 @@ class ServerState:
                 else:
                     all_pcm_data = np.concatenate((all_pcm_data, pcm))
                 while all_pcm_data.shape[-1] >= self.frame_size:
+                    opus_frames_processed += 1
+                    if opus_frames_processed == 1:
+                        clog.log("info", f"P0_DEBUG opus_loop FIRST_FRAME elapsed={time.time()-opus_loop_start_time:.3f}s")
                     be = time.time()
                     chunk = all_pcm_data[: self.frame_size]
                     all_pcm_data = all_pcm_data[self.frame_size:]
@@ -223,16 +369,155 @@ class ServerState:
                     chunk = chunk.to(device=self.device)[None, None]
                     codes = self.mimi.encode(chunk)
                     _ = self.other_mimi.encode(chunk)
+
+                    # [CredKey] Phase 1.6: Generation Gate - prevent step() during gate window
+                    if not gen_gate_released:
+                        if opus_frames_processed >= CREDKEY_GEN_GATE_N:
+                            gen_gate_released = True
+                            elapsed_ms = (time.time() - opus_loop_start_time) * 1000
+                            clog.log("info",
+                                f"[CredKey] GEN_GATE_RELEASED inbound_frames={opus_frames_processed} "
+                                f"ms_since_start={elapsed_ms:.1f} skipped_steps={skipped_gen_steps}")
+                        else:
+                            skipped_gen_steps += 1
+                            continue  # Skip generation entirely - no step(), no decode(), no emit
+
                     for c in range(codes.shape[-1]):
-                        tokens = self.lm_gen.step(codes[:, :, c: c + 1])
+                        codes_slice = codes[:, :, c: c + 1]
+
+                        # ── Phase 2 §1: Consume pending text → tokenize → queue ──
+                        if CREDKEY_INLINE_TEXT and self._pending_inline_text is not None:
+                            try:
+                                inline_text = self._pending_inline_text
+                                self._pending_inline_text = None
+                                new_tokens = self.text_tokenizer.encode(inline_text)
+                                if len(new_tokens) > INLINE_TOKEN_CAP:
+                                    clog.log("warning",
+                                        f"INLINE_TEXT_TOKEN_CAP "
+                                        f"{len(new_tokens)} -> {INLINE_TOKEN_CAP}")
+                                    new_tokens = new_tokens[:INLINE_TOKEN_CAP]
+                                eos_appended = 0
+                                if CREDKEY_INLINE_EOS:
+                                    eos = getattr(self.text_tokenizer, 'eos_id', None)
+                                    eos_val = eos() if callable(eos) else eos
+                                    if eos_val is not None and eos_val >= 0:
+                                        new_tokens.append(eos_val)
+                                        eos_appended = 1
+                                self._inline_text_tokens.clear()
+                                self._inline_text_tokens.extend(new_tokens)
+                                self._inline_pause_frames = 0
+                                self._inline_postpad_remaining = 0
+                                self._inline_inject_active = True
+                                self._inline_forced_log = []
+                                self._inline_emitted_log = []
+                                self._inline_frames_in_inject = 0
+                                if self._inline_idle_pad_on:
+                                    clog.log("info", "INLINE_IDLE_PAD_OFF")
+                                    self._inline_idle_pad_on = False
+                                clog.log("info",
+                                    f"INLINE_TEXT_TOKENIZED tokens={len(new_tokens)} "
+                                    f"eos_enabled={1 if CREDKEY_INLINE_EOS else 0} "
+                                    f"eos_appended={eos_appended} "
+                                    f"text={inline_text[:80]}")
+                            except Exception as e:
+                                clog.log("error", f"INLINE_TEXT_TOKENIZE_FAILED: {e}")
+
+                        # ── Phase 2 §2: Pick forced text_token for this frame ──
+                        forced_text_token = None
+
+                        # A) Active injection: force content or PAD tokens
+                        if CREDKEY_INLINE_TEXT and self._inline_inject_active:
+                            self._inline_frames_in_inject += 1
+
+                            if self._inline_pause_frames > 0:
+                                forced_text_token = TEXT_PAD_ID
+                                self._inline_pause_frames -= 1
+                            elif self._inline_text_tokens:
+                                # Stride: only inject a real token every N frames, PAD in between
+                                if CREDKEY_INJECT_STRIDE <= 1 or self._inline_frames_in_inject == 1 or (self._inline_frames_in_inject % CREDKEY_INJECT_STRIDE) == 1:
+                                    forced_text_token = self._inline_text_tokens.popleft()
+                                    if self._inline_forced_log is not None and forced_text_token not in (0, 1, 2, 3):
+                                        self._inline_forced_log.append(forced_text_token)
+                                    if CREDKEY_INLINE_PROSODY and forced_text_token in _PUNCT_PAUSE:
+                                        self._inline_pause_frames = _PUNCT_PAUSE[forced_text_token]
+                                    if self._inline_frames_in_inject == 1:
+                                        clog.log("info",
+                                            f"INLINE_INJECT_START first_tok={forced_text_token} "
+                                            f"stride={CREDKEY_INJECT_STRIDE} "
+                                            f"qlen={len(self._inline_text_tokens)}")
+                                else:
+                                    forced_text_token = TEXT_PAD_ID  # PAD on off-stride frames
+                            else:
+                                # Queue drained — injection complete
+                                self._inline_inject_active = False
+                                # Start post-line PAD hold
+                                if CREDKEY_POST_PAD_FRAMES > 0:
+                                    self._inline_postpad_remaining = CREDKEY_POST_PAD_FRAMES
+                                    clog.log("info", f"INLINE_POSTPAD_START frames={CREDKEY_POST_PAD_FRAMES}")
+                                # Log comparison
+                                if self._inline_forced_log is not None:
+                                    forced_text = self.text_tokenizer.decode(self._inline_forced_log)
+                                    emitted_text = self.text_tokenizer.decode(
+                                        self._inline_emitted_log or [])
+                                    match_pct = 0
+                                    if forced_text:
+                                        common = sum(1 for a, b in zip(forced_text, emitted_text) if a == b)
+                                        match_pct = int(100 * common / len(forced_text))
+                                    clog.log("info",
+                                        f"INLINE_INJECT_DONE "
+                                        f"forced={len(self._inline_forced_log)}tok "
+                                        f"emitted={len(self._inline_emitted_log or [])}tok "
+                                        f"frames={self._inline_frames_in_inject} "
+                                        f"char_match={match_pct}%")
+                                    clog.log("info", f"INLINE_FORCED:  {forced_text[:150]}")
+                                    clog.log("info", f"INLINE_EMITTED: {emitted_text[:150]}")
+                                self._inline_forced_log = None
+                                self._inline_emitted_log = None
+                                # Fall through to idle pad below
+
+                        # B) Post-line PAD hold (brief silence after scripted line)
+                        if forced_text_token is None and self._inline_postpad_remaining > 0:
+                            forced_text_token = TEXT_PAD_ID
+                            self._inline_postpad_remaining -= 1
+                            if self._inline_postpad_remaining == 0:
+                                clog.log("info", "INLINE_POSTPAD_END")
+
+                        # C) Idle PAD suppression: prevent hallucination between injections
+                        if forced_text_token is None and CREDKEY_INLINE_TEXT and CREDKEY_IDLE_PAD:
+                            if not self._inline_inject_active and not self._inline_text_tokens:
+                                forced_text_token = TEXT_PAD_ID
+                                if not self._inline_idle_pad_on:
+                                    self._inline_idle_pad_on = True
+                                    clog.log("info", "INLINE_IDLE_PAD_ON")
+
+                        # ── Phase 2 §3: Call lm_gen.step — always real codes ──
+                        if forced_text_token is not None:
+                            tokens = self.lm_gen.step(
+                                codes_slice,
+                                text_token=forced_text_token,
+                            )
+                        else:
+                            tokens = self.lm_gen.step(codes_slice)
                         if tokens is None:
                             continue
                         assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
                         main_pcm = self.mimi.decode(tokens[:, 1:9])
                         _ = self.other_mimi.decode(tokens[:, 1:9])
                         main_pcm = main_pcm.cpu()
-                        opus_writer.append_pcm(main_pcm[0, 0].numpy())
+                        pcm_data = main_pcm[0, 0].numpy()
+                        opus_writer.append_pcm(pcm_data)
+                        opus_writes_to_writer += 1
+                        if opus_writes_to_writer == 1:
+                            clog.log("info", f"P0_DEBUG FIRST_OPUS_WRITE pcm_samples={len(pcm_data)} elapsed={time.time()-opus_loop_start_time:.3f}s")
+                        if opus_writes_to_writer % 100 == 0:
+                            clog.log("info", f"P0_DEBUG opus_writes={opus_writes_to_writer} frames_processed={opus_frames_processed}")
                         text_token = tokens[0, 0, 0].item()
+
+                        # ── Phase 2 §4: Track emitted tokens during injection ──
+                        if CREDKEY_INLINE_TEXT and self._inline_emitted_log is not None:
+                            if text_token not in (0, 1, 2, 3):
+                                self._inline_emitted_log.append(text_token)
+
                         if text_token not in (0, 3):
                             _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
                             _text = _text.replace("▁", " ")
@@ -242,17 +527,38 @@ class ServerState:
                             text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
 
         async def send_loop():
+            clog.log("info", "P0_DEBUG send_loop STARTED")
+            send_count = 0
+            send_bytes_total = 0
+            send_empty_polls = 0
+            send_start_time = time.time()
+            last_empty_log = time.time()
             while True:
                 if close:
+                    clog.log("info", f"P0_DEBUG send_loop ENDED close=True sends={send_count} bytes={send_bytes_total} empty_polls={send_empty_polls}")
                     return
                 await asyncio.sleep(0.001)
                 msg = opus_writer.read_bytes()
                 if len(msg) > 0:
+                    send_count += 1
+                    send_bytes_total += len(msg)
+                    if send_count == 1:
+                        clog.log("info", f"P0_DEBUG FIRST_SEND_TO_SHIM bytes={len(msg)} elapsed={time.time()-send_start_time:.3f}s")
+                    if send_count % 100 == 0:
+                        clog.log("info", f"P0_DEBUG send_loop sends={send_count} bytes_total={send_bytes_total}")
                     await ws.send_bytes(b"\x01" + msg)
+                else:
+                    send_empty_polls += 1
+                    now = time.time()
+                    if now - last_empty_log >= 2.0:
+                        clog.log("info", f"P0_DEBUG send_loop EMPTY_OPUS_BUFFER empty_polls={send_empty_polls} sends={send_count} elapsed={now-send_start_time:.3f}s")
+                        last_empty_log = now
 
         clog.log("info", "accepted connection")
-        if len(request.query["text_prompt"]) > 0:
-            clog.log("info", f"text prompt: {request.query['text_prompt']}")
+        if CREDKEY_INLINE_TEXT:
+            clog.log("info", f"INLINE_TEXT_ON token_cap={INLINE_TOKEN_CAP}")
+        if len(text_prompt) > 0:
+            clog.log("info", f"text prompt: {text_prompt[:200] + '...' if len(text_prompt) > 200 else text_prompt}")
         if len(request.query["voice_prompt"]) > 0:
             clog.log("info", f"voice prompt: {voice_prompt_path} (requested: {requested_voice_prompt_path})")
         close = False
@@ -287,12 +593,27 @@ class ServerState:
             if await is_alive():
                 await ws.send_bytes(b"\x00")
                 clog.log("info", "sent handshake bytes")
+                clog.log("info", f"P0_DEBUG ws_closed={ws.closed} close_flag={close}")
                 # Clean cancellation manager
                 tasks = [
                     asyncio.create_task(recv_loop()),
                     asyncio.create_task(opus_loop()),
                     asyncio.create_task(send_loop()),
                 ]
+
+                # P0 DEBUG: Add done callbacks to catch silent task deaths
+                task_names = ['recv_loop', 'opus_loop', 'send_loop']
+                for task, name in zip(tasks, task_names):
+                    def make_cb(n):
+                        def cb(t):
+                            if t.cancelled():
+                                clog.log("info", f"P0_DEBUG TASK_CANCELLED {n}")
+                            elif t.exception():
+                                clog.log("error", f"P0_DEBUG TASK_DIED {n} exception={t.exception()}")
+                            else:
+                                clog.log("info", f"P0_DEBUG TASK_FINISHED {n}")
+                        return cb
+                    task.add_done_callback(make_cb(name))
 
                 done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                 # Force-kill remaining tasks
