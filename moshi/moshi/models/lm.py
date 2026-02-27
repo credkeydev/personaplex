@@ -687,6 +687,7 @@ class LMGen(StreamingModule[_LMGenState]):
         if report_loss:
             return_logits = True
         self.return_logits = return_logits
+        self._last_sampled_text_token = None  # side-channel for model-guided pacing (Python int)
         self.max_delay = max(
             lm_model.delays
         )  # with delays, we need to generate a few more time steps.
@@ -888,6 +889,7 @@ class LMGen(StreamingModule[_LMGenState]):
         assert sampled_text_token.shape[2] == 1
         assert sampled_text_token.shape[1] == 1, "Only one text stream supported."
         sampled_text_token = sampled_text_token[:, 0, 0]  # shape is [B]
+        self._last_sampled_text_token = int(sampled_text_token.item())  # model-guided pacing side-channel
 
         next_text_token = torch.where(provided_[:, 0, 0], target_[:, 0, 0], sampled_text_token)
 

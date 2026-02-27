@@ -163,6 +163,9 @@ CREDKEY_IDLE_PAD = os.environ.get("CREDKEY_IDLE_PAD", "1") == "1"           # fo
 CREDKEY_INLINE_PROSODY = os.environ.get("CREDKEY_INLINE_PROSODY", "0") == "1"
 CREDKEY_POST_PAD_FRAMES = int(os.environ.get("CREDKEY_POST_PAD_FRAMES", "0"))
 CREDKEY_INJECT_STRIDE = int(os.environ.get("CREDKEY_INJECT_STRIDE", "1"))  # frames between token injections  # extra PAD frames after line ends
+CREDKEY_MODEL_GUIDED_PACE = os.environ.get("CREDKEY_MODEL_GUIDED_PACE", "0") == "1"
+CREDKEY_PACE_MAX_HOLD = int(os.environ.get("CREDKEY_PACE_MAX_HOLD", "8"))
+CREDKEY_PACE_MIN_HOLD = int(os.environ.get("CREDKEY_PACE_MIN_HOLD", "1"))
 INLINE_TOKEN_CAP = 250  # hard cap: drop tokens beyond this
 TEXT_PAD_ID = 3   # <pad> — blank/no-text token
 # Prosody: pause frames after punctuation (only when CREDKEY_INLINE_PROSODY=1)
@@ -203,6 +206,8 @@ class ServerState:
         self._inline_forced_log = None            # comparison: forced token accumulator
         self._inline_emitted_log = None           # comparison: emitted token accumulator
         self._inline_frames_in_inject = 0         # for rate-limited logging
+        self._inline_hold_frames = 0                # model-guided: PAD frames since last content token
+        self._inline_awaiting_model_advance = False  # model-guided: True = holding on PAD, watching model signal
         self.lock = asyncio.Lock()
         self.mimi.streaming_forever(1)
         self.other_mimi.streaming_forever(1)
@@ -411,6 +416,8 @@ class ServerState:
                                 self._inline_forced_log = []
                                 self._inline_emitted_log = []
                                 self._inline_frames_in_inject = 0
+                                self._inline_hold_frames = 0
+                                self._inline_awaiting_model_advance = False
                                 if self._inline_idle_pad_on:
                                     clog.log("info", "INLINE_IDLE_PAD_OFF")
                                     self._inline_idle_pad_on = False
@@ -433,20 +440,50 @@ class ServerState:
                                 forced_text_token = TEXT_PAD_ID
                                 self._inline_pause_frames -= 1
                             elif self._inline_text_tokens:
-                                # Stride: only inject a real token every N frames, PAD in between
-                                if CREDKEY_INJECT_STRIDE <= 1 or self._inline_frames_in_inject == 1 or (self._inline_frames_in_inject % CREDKEY_INJECT_STRIDE) == 1:
-                                    forced_text_token = self._inline_text_tokens.popleft()
-                                    if self._inline_forced_log is not None and forced_text_token not in (0, 1, 2, 3):
-                                        self._inline_forced_log.append(forced_text_token)
-                                    if CREDKEY_INLINE_PROSODY and forced_text_token in _PUNCT_PAUSE:
-                                        self._inline_pause_frames = _PUNCT_PAUSE[forced_text_token]
-                                    if self._inline_frames_in_inject == 1:
-                                        clog.log("info",
-                                            f"INLINE_INJECT_START first_tok={forced_text_token} "
-                                            f"stride={CREDKEY_INJECT_STRIDE} "
-                                            f"qlen={len(self._inline_text_tokens)}")
+                                # Phase 3: model-guided pacing or legacy stride
+                                if CREDKEY_MODEL_GUIDED_PACE:
+                                    if not self._inline_awaiting_model_advance:
+                                        # Emit next content token immediately
+                                        forced_text_token = self._inline_text_tokens.popleft()
+                                        if self._inline_forced_log is not None and forced_text_token not in (0, 1, 2, 3):
+                                            self._inline_forced_log.append(forced_text_token)
+                                        if CREDKEY_INLINE_PROSODY and forced_text_token in _PUNCT_PAUSE:
+                                            self._inline_pause_frames = _PUNCT_PAUSE[forced_text_token]
+                                        self._inline_awaiting_model_advance = True
+                                        self._inline_hold_frames = 0
+                                        if self._inline_frames_in_inject == 1:
+                                            clog.log("info",
+                                                f"INLINE_INJECT_START first_tok={forced_text_token} "
+                                                f"mode=model_guided max_hold={CREDKEY_PACE_MAX_HOLD} "
+                                                f"min_hold={CREDKEY_PACE_MIN_HOLD} "
+                                                f"qlen={len(self._inline_text_tokens)}")
+                                    else:
+                                        # Hold on PAD, check model signal
+                                        forced_text_token = TEXT_PAD_ID
+                                        self._inline_hold_frames += 1
+                                        last_sampled = self.lm_gen._last_sampled_text_token  # Python int, no GPU sync
+                                        model_wants_advance = (last_sampled is not None and last_sampled != TEXT_PAD_ID)
+                                        past_min = self._inline_hold_frames >= CREDKEY_PACE_MIN_HOLD
+                                        past_max = self._inline_hold_frames >= CREDKEY_PACE_MAX_HOLD
+                                        if (model_wants_advance and past_min) or past_max:
+                                            if past_max and not model_wants_advance:
+                                                clog.log("warning", f"PACE_MAX_HOLD_HIT hold={self._inline_hold_frames}")
+                                            self._inline_awaiting_model_advance = False  # next frame pops next token
                                 else:
-                                    forced_text_token = TEXT_PAD_ID  # PAD on off-stride frames
+                                    # Legacy stride mode
+                                    if CREDKEY_INJECT_STRIDE <= 1 or self._inline_frames_in_inject == 1 or (self._inline_frames_in_inject % CREDKEY_INJECT_STRIDE) == 1:
+                                        forced_text_token = self._inline_text_tokens.popleft()
+                                        if self._inline_forced_log is not None and forced_text_token not in (0, 1, 2, 3):
+                                            self._inline_forced_log.append(forced_text_token)
+                                        if CREDKEY_INLINE_PROSODY and forced_text_token in _PUNCT_PAUSE:
+                                            self._inline_pause_frames = _PUNCT_PAUSE[forced_text_token]
+                                        if self._inline_frames_in_inject == 1:
+                                            clog.log("info",
+                                                f"INLINE_INJECT_START first_tok={forced_text_token} "
+                                                f"stride={CREDKEY_INJECT_STRIDE} "
+                                                f"qlen={len(self._inline_text_tokens)}")
+                                    else:
+                                        forced_text_token = TEXT_PAD_ID  # PAD on off-stride frames
                             else:
                                 # Queue drained — injection complete
                                 self._inline_inject_active = False
