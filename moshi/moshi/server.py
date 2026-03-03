@@ -608,6 +608,18 @@ class ServerState:
             self.mimi.reset_streaming()
             self.other_mimi.reset_streaming()
             self.lm_gen.reset_streaming()
+            # FIX-C: Reset per-session injection state to prevent cross-session contamination
+            self._pending_inline_text = None
+            self._inline_text_tokens.clear()
+            self._inline_pause_frames = 0
+            self._inline_inject_active = False
+            self._inline_postpad_remaining = 0
+            self._inline_idle_pad_on = False
+            self._inline_forced_log = None
+            self._inline_emitted_log = None
+            self._inline_frames_in_inject = 0
+            self._inline_hold_frames = 0
+            self._inline_awaiting_model_advance = False
             async def is_alive():
                 if close or ws.closed:
                     return False
@@ -622,6 +634,11 @@ class ServerState:
                 except aiohttp.ClientConnectionError:
                     return False
                 return True
+            # FIX-B: Bail early if shim already disconnected while we waited on the lock
+            # Saves 31-43 seconds of wasted GPU compute per dead connection
+            if ws.closed:
+                clog.log("warning", "CLIENT_GONE_BEFORE_PROMPTS ws.closed=True -- skipping system prompts")
+                return ws
             # Reuse mimi for encoding voice prompt and then reset it before conversation starts
             await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive)
             self.mimi.reset_streaming()
